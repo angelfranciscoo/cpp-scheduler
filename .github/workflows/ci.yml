@@ -1,0 +1,137 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} / ${{ matrix.compiler }} / ${{ matrix.build_type }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        compiler: [gcc, clang]
+        build_type: [Debug, RelWithDebInfo]
+        exclude:
+          # Apple clang is the only supported toolchain on the macOS runner.
+          - os: macos-latest
+            compiler: gcc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select compiler
+        if: runner.os == 'Linux'
+        run: |
+          if [ "${{ matrix.compiler }}" = "gcc" ]; then
+            echo "CC=gcc"  >> "$GITHUB_ENV"
+            echo "CXX=g++"  >> "$GITHUB_ENV"
+          else
+            echo "CC=clang" >> "$GITHUB_ENV"
+            echo "CXX=clang++" >> "$GITHUB_ENV"
+          fi
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DRTSCHED_WERROR=ON
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Unit tests
+        run: ctest --test-dir build -L unit --output-on-failure
+
+      - name: Stress tests
+        run: ctest --test-dir build -L stress --output-on-failure
+
+      - name: Example
+        run: ./build/rtsched_example
+
+  # The concurrency design rests on claims about data races and memory
+  # ordering. This job is what makes those claims verifiable rather than
+  # asserted: the unit and stress suites run under ThreadSanitizer, which
+  # instruments every shared access the lock-free paths perform.
+  sanitizers:
+    name: ubuntu / ${{ matrix.sanitizer }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sanitizer: tsan
+            flags: -DRTSCHED_ENABLE_TSAN=ON
+          - sanitizer: asan-ubsan
+            flags: -DRTSCHED_ENABLE_ASAN=ON -DRTSCHED_ENABLE_UBSAN=ON
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          ${{ matrix.flags }}
+        env:
+          CC: clang
+          CXX: clang++
+
+      - name: Build
+        run: cmake --build build -j
+        env:
+          CC: clang
+          CXX: clang++
+
+      # halt_on_error=1 so a single race fails the job rather than being
+      # buried in the log. Sanitized builds are slow, hence the long timeout.
+      - name: Unit tests
+        run: ctest --test-dir build -L unit --output-on-failure --timeout 1800
+        env:
+          TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1
+          ASAN_OPTIONS: detect_leaks=1 abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1 halt_on_error=1
+
+      - name: Stress tests
+        run: ctest --test-dir build -L stress --output-on-failure --timeout 3600
+        env:
+          TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1
+          ASAN_OPTIONS: detect_leaks=1 abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1 halt_on_error=1
+
+  # Repeat the concurrency-sensitive tests to catch flakiness that a single
+  # pass would miss. A scheduler that passes once is not a scheduler that works.
+  repeat-concurrency:
+    name: ubuntu / repeated concurrency tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build -j
+      - name: Repeat 20x
+        run: |
+          ./build/rtsched_unit_tests \
+            --gtest_filter='*Concurrency*:*StateMachine*:*Lifecycle*:*MpmcQueue*' \
+            --gtest_repeat=20 --gtest_break_on_failure
+
+  benchmark:
+    name: ubuntu / benchmark smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+      # --quick keeps CI time sane; a shared runner's absolute numbers are not
+      # meaningful anyway. This verifies the harness runs and emits valid CSV.
+      - name: Run benchmark
+        run: ./build/rtsched_benchmark ci_benchmark.csv --quick
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: ci_benchmark.csv

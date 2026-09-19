@@ -1,0 +1,10 @@
+build/
+build-*/
+cmake-build-*/
+/benchmark_results.csv
+/ci_benchmark.csv
+.cache/
+compile_commands.json
+.DS_Store
+*.o
+*.a
