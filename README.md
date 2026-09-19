@@ -21,10 +21,17 @@ Sustained **200,000 tasks/second at a 25 µs p99 scheduling latency**, and
                      └── lock-free, no ordering ────┴── ordered, amortized lock
 ```
 
-Submission is lock-free; ordering is provided by a mutex-protected heap that
-workers drain in batches under a lock they had to take anyway. Producers never
-pay for ordering, and the ordering cost is amortized across every task that
-arrived since the last drain.
+The queue handoff is lock-free; ordering is provided by a mutex-protected heap
+that workers drain in batches under a lock they had to take anyway. Producers
+never pay for ordering, and the ordering cost is amortized across every task
+that arrived since the last drain.
+
+To be precise about what is and is not lock-free: `submit_task` also allocates
+one `Task` and takes a **sharded registry mutex** so the id stays queryable, so
+the call as a whole is not lock-free. What the ring buys is that the contended
+multi-producer path — the queue — is not a serialization point. The registry
+lock is sharded and the allocation is the first thing to remove if submission
+throughput ever becomes the limit.
 
 ---
 
@@ -252,7 +259,9 @@ total order. Splitting them lets each get what it needs:
 1. **Ingress** — a bounded lock-free MPMC ring ([Vyukov's
    algorithm](include/rtsched/mpmc_queue.h)). A producer claims a slot with
    one CAS on a cursor and publishes with one release-store. No mutex, no
-   allocation, no blocking. Preallocated, so overload cannot grow memory.
+   allocation, no blocking *within the ring*. Preallocated, so overload cannot
+   grow memory. (The surrounding `submit_task` does allocate the `Task` and
+   take a sharded registry lock — see above.)
 2. **Egress** — a mutex-protected binary heap ordered by
    `(priority DESC, deadline ASC, sequence ASC)`. A worker takes the lock
    once and does two things under it: drains *everything* from the ring into

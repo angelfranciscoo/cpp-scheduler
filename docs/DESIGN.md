@@ -29,12 +29,23 @@ The key move is **where** the transfer happens. A worker that wants a task
 must take the heap lock regardless. While it holds that lock it drains the
 entire ring into the heap, then pops. So:
 
-- Producers never touch the heap lock (see §3 for the one exception).
+- Producers never touch the heap lock for *ordering* (see §3 for the one
+  exception, and the scope note below for what submission does still lock).
 - The lock is amortized across every task that arrived since the last drain.
   Under load a single acquisition moves dozens of tasks.
 - The ring's FIFO order is irrelevant — the heap reorders everything anyway,
   which is why a *FIFO* lock-free queue is sufficient here and a lock-free
   *priority* queue is not needed.
+
+**Scope note — what is actually lock-free.** The claim is about the *queue
+handoff*, not about `submit_task` as a whole. Every submission also allocates
+one `Task` and takes a sharded registry mutex so the id stays queryable, and a
+submission that finds the ring full takes the heap mutex. So the call is not
+lock-free end to end. What the ring buys is that the contended multi-producer
+path is not a serialization point: registry contention is divided by
+`registry_shards`, while a single shared queue mutex would not divide at all.
+If submission throughput ever became the limit, the allocation and the
+registry insert are the two things to attack — in that order.
 
 A dedicated pump thread was considered instead of draining from the workers.
 It was rejected: it adds a thread and a hop of latency, and it makes the pump
@@ -111,8 +122,9 @@ Therefore:
 
 - **Producer sees no idle worker** → it may skip the notify entirely, because
   every worker is guaranteed to see the work before sleeping. This is the
-  steady state under load, and it is why submission is genuinely lock-free
-  when the pool is busy.
+  steady state under load, and it is why the queue handoff touches no mutex at
+  all when the pool is busy (the registry lock in §1's scope note still
+  applies).
 - **Producer sees an idle worker** → it takes the queue mutex for zero work
   and then notifies. The empty critical section is not a trick; it is the only
   correct way to serialize against a waiter sitting between its predicate and

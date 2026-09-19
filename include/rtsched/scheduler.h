@@ -14,9 +14,19 @@
 //                                                 +--> [ binary heap ] --> run
 //   submit_task() ---> [ mutex: ring-full path ]--+          (priority)
 //
-// Submission is lock-free in the common case: a producer CASes a slot in a
-// bounded ring and leaves. It never touches the heap mutex, so N producers do
-// not serialize against each other or against the workers.
+// The *queue handoff* is lock-free: a producer CASes a slot in a bounded ring
+// and leaves, never touching the heap mutex, so N producers do not serialize
+// against each other or against the workers for ordering.
+//
+// Submission as a whole is NOT lock-free, and the distinction matters. Every
+// submit_task() also allocates one Task and takes a sharded registry mutex to
+// make the id queryable; a submission that finds the ring full takes the heap
+// mutex; and one that finds a worker asleep briefly takes the queue mutex to
+// hand off the wakeup. What the lock-free ring buys is that the *contended*
+// multi-producer path -- the queue itself -- is not a serialization point.
+// The registry lock is sharded (contention is 1/registry_shards) and the
+// allocation is the first thing to remove if submission throughput ever
+// becomes the limit; see docs/TUNING.md.
 //
 // Ordering is provided by a mutex-protected binary heap. A worker that wants
 // work takes the heap lock once and does two things under it: drains every
@@ -213,8 +223,10 @@ class PriorityScheduler {
 
   // --- Submission -----------------------------------------------------------
 
-  // Submits a task and returns its id. Thread-safe and lock-free unless the
-  // ingress ring is full.
+  // Submits a task and returns its id. Thread-safe. The queue handoff is
+  // lock-free, but the call is not: it allocates a Task and takes a sharded
+  // registry mutex, plus the heap mutex if the ingress ring is full. See the
+  // queue-architecture note at the top of this header.
   //
   // Throws std::invalid_argument for a priority outside [kMinPriority,
   // kMaxPriority] or a null callback, SchedulerNotRunning after stop(), and
@@ -340,7 +352,7 @@ class PriorityScheduler {
   std::atomic<Lifecycle> lifecycle_{Lifecycle::CREATED};
   std::atomic<std::uint64_t> next_task_id_{1};
 
-  // Ingress: lock-free submission path.
+  // Ingress: the lock-free half of the submission path.
   MpmcBoundedQueue<std::shared_ptr<Task>> ingress_;
 
   // Egress: priority ordering. queue_mutex_ also guards `pending_`
