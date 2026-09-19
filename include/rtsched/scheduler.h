@@ -7,11 +7,12 @@
 // Queue architecture
 // ---------------------------------------------------------------------------
 //
-//   producers                                        workers
-//   ---------                                        -------
-//   submit_task() --> [ lock-free MPMC ring ] --\
-//                          (ingress)             >-- [ binary heap ] --> run
-//   submit_task() --> [ mutex (ring-full path) ]-/     (priority)
+//   producers                                         workers
+//   ---------                                         -------
+//   submit_task() ---> [ lock-free MPMC ring ] ---+
+//                            (ingress)            |
+//                                                 +--> [ binary heap ] --> run
+//   submit_task() ---> [ mutex: ring-full path ]--+          (priority)
 //
 // Submission is lock-free in the common case: a producer CASes a slot in a
 // bounded ring and leaves. It never touches the heap mutex, so N producers do
